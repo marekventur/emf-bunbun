@@ -1,0 +1,27 @@
+[app]
+# The name of your app as displayed in the badge menu.
+name = "BunBun"
+
+# The submenu where your app appears.
+# One of: "Badge", "Music", "Media", "Apps", "Games", "Background"
+category = "Badge"
+
+[entry]
+# The name of your App subclass (must match the class in app.py).
+class = "Bunny"
+
+[metadata]
+# Your nickname. Max 32 characters.
+author = "marekventur"
+
+# License as an SPDX identifier: https://spdx.org/licenses/
+license = "MIT"
+
+# URL to the public repository of your app (GitHub or Codeberg).
+url = "https://github.com/marekventur/emf-bunbun"
+
+# Description of your app. Max 140 characters!
+description = "A tiny pixel bunny to love. Pet it, feed it, dress it in new colours. It pulses orange when hungry so friends can tell you."
+
+# Version string. Bump this to publish a new release.
+version = "0.0.1"

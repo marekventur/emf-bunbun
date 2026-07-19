@@ -1,0 +1,9 @@
+# The badge firmware/simulator checkout lives alongside for development
+badge-2024-software/
+
+# Dev-only files: used when copying to a badge / the simulator by hand,
+# not part of the published app (the store only wants app.py + tildagon.toml)
+metadata.json
+
+__pycache__/
+.DS_Store
