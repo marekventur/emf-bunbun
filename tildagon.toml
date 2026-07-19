@@ -24,4 +24,4 @@ url = "https://github.com/marekventur/emf-bunbun"
 description = "A tiny pixel bunny to love. Pet it, feed it, dress it in new colours. It pulses orange when hungry so friends can tell you."
 
 # Version string. Bump this to publish a new release.
-version = "0.0.3"
+version = "0.0.4"

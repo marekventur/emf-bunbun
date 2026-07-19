@@ -1,5 +1,6 @@
 import math
 import random
+import time
 
 from app import App
 from app_components import clear_background
@@ -32,6 +33,12 @@ try:
 except ImportError:
     HAS_SETTINGS = False
 
+try:
+    from system.scheduler.events import RequestForegroundPushEvent
+    HAS_SUMMON = True
+except ImportError:
+    HAS_SUMMON = False
+
 # Touch pads (2026 frontboard): TOUCH01..TOUCH12 arrive as button events
 try:
     from system.eventbus import eventbus as touch_eventbus
@@ -49,7 +56,15 @@ SLEEPY_TIME = 20000                     # nap after too much petting
 PETS_UNTIL_SLEEPY = 5                   # pets in quick succession before nap
 PET_MEMORY = 15000                      # how long "quick succession" lasts
 PALETTE_FLASH_TIME = 1500               # how long the palette name shows
-IDLE_FLOP_TIME = 4000                   # how long a lazy ear-flop moment lasts
+IDLE_FLOP_TIME = 4000                   # how long the content flop lasts
+IDLE_LOOK_TIME = 5000                   # glances hold longer
+IDLE_CONTENT = 0                        # idle moments: content smile...
+IDLE_LOOK_L = 1                         # ...glance left...
+IDLE_LOOK_UR = 2                        # ...glance up-right
+NAP_AFTER_MIN = 120000                  # spontaneous nap after 2...
+NAP_AFTER_MAX = 240000                  # ...to 4 quiet minutes
+NAP_MIN = 30000                         # spontaneous naps last 30-60s
+NAP_MAX = 60000
 BATTERY_FLASH_TIME = 4000               # how long the battery peek shows
 BATT_SAMPLE_MS = 60000                  # battery sampled once a minute
 STROKE_WINDOW = 900                     # two touch pads within this = a stroke
@@ -181,6 +196,8 @@ LOWER = [
 # row 13. Mouths sit under the nose, centered on col 13.
 EYE_OPEN = ["XX", "XX"]        # base drawing
 EYE_FLAT = ["XX"]              # chill/content line eyes
+EYE_LOOK = ["X", "X"]          # narrow glancing eyes (look left / up-right)
+EYE_SLEEPY = ["XX"]            # nap lines, drawn low and wide
 TEAR = ["b", "b"]
 
 NOSE_PATCH = ["ooo"]                      # hides the nose dot at (12,15)
@@ -227,6 +244,9 @@ class Bunny(App):
         self.blinking = 0
         self.idle_flop = 0
         self.idle_flop_timer = self._new_flop_timer()
+        self.idle_kind = IDLE_CONTENT
+        self.idle_queue = []
+        self.nap_timer = self._new_nap_timer()
 
         self.last_leds = None
 
@@ -247,7 +267,7 @@ class Bunny(App):
         self.imu_timer = 0
 
         # Stroke-to-pet via the 2026 board touch pads
-        self._foreground = True
+        self._last_beat = 0
         self._touch_last = None
         self._touch_last_t = -STROKE_WINDOW
         if HAS_TOUCH:
@@ -257,10 +277,13 @@ class Bunny(App):
         return random.randint(HUNGRY_AFTER_MIN, HUNGRY_AFTER_MAX)
 
     def _new_blink_timer(self):
-        return random.randint(2500, 6000)
+        return random.randint(1500, 4000)
 
     def _new_flop_timer(self):
-        return random.randint(15000, 40000)
+        return random.randint(8000, 18000)
+
+    def _new_nap_timer(self):
+        return random.randint(NAP_AFTER_MIN, NAP_AFTER_MAX)
 
     def _apply_palette(self):
         name, outline, accent, bg_top, bg_bottom = PALETTES[self.palette_index]
@@ -275,7 +298,7 @@ class Bunny(App):
 
     def update(self, delta):
         self.time += delta
-        self._foreground = True
+        self._last_beat = self._ticks()
 
         # Battery: sample once a minute, learn the drain rate
         self.batt_sample_timer -= delta
@@ -302,7 +325,6 @@ class Bunny(App):
 
         if self.button_states.get(BUTTON_TYPES["CANCEL"]):
             self.button_states.clear()
-            self._foreground = False
             self._leds_off()
             if HAS_LEDS:
                 eventbus.emit(PatternEnable())  # give LEDs back to the OS
@@ -317,15 +339,32 @@ class Bunny(App):
         if self.blinking > 0:
             self.blinking -= delta
 
-        # Occasional lazy ear-flop moment while idle
+        # Occasional lazy idle moments while chilling, and after a few
+        # quiet minutes it drifts off for a little nap on its own
         if self.state == CHILL and self.happy_timer <= 0:
             if self.idle_flop > 0:
                 self.idle_flop -= delta
+                if self.idle_flop <= 0 and self.idle_queue:
+                    self.idle_kind = self.idle_queue.pop(0)
+                    self.idle_flop = IDLE_LOOK_TIME
             else:
                 self.idle_flop_timer -= delta
                 if self.idle_flop_timer <= 0:
-                    self.idle_flop = IDLE_FLOP_TIME
                     self.idle_flop_timer = self._new_flop_timer()
+                    if random.randint(0, 1) == 0:
+                        self.idle_kind = IDLE_CONTENT
+                        self.idle_queue = []
+                        self.idle_flop = IDLE_FLOP_TIME
+                    else:
+                        self.idle_kind = IDLE_LOOK_L
+                        self.idle_queue = [IDLE_LOOK_UR]
+                        self.idle_flop = IDLE_LOOK_TIME
+            self.nap_timer -= delta
+            if self.nap_timer <= 0:
+                self.state = SLEEPY
+                self.state_timer = random.randint(NAP_MIN, NAP_MAX)
+                self.idle_flop = 0
+                self.nap_timer = self._new_nap_timer()
         else:
             self.idle_flop = 0
 
@@ -422,6 +461,7 @@ class Bunny(App):
         self.pet_ear = ear
         self.happy_timer = PET_HAPPY_TIME
         self.idle_flop = 0
+        self.nap_timer = self._new_nap_timer()
 
         # Pick a different reaction than last time
         choices = [REACT_HEARTS, REACT_STARS, REACT_BOUNCE]
@@ -474,13 +514,34 @@ class Bunny(App):
         self.state = EATING
         self.state_timer = EAT_TIME
         self.idle_flop = 0
+        self.nap_timer = self._new_nap_timer()
 
     # -------------------------------------------------------------- touch
 
+    def _ticks(self):
+        if hasattr(time, "ticks_ms"):
+            return time.ticks_ms()
+        return int(time.time() * 1000)
+
+    def _is_foreground(self):
+        # Foreground apps get update() every frame; if the heartbeat is
+        # stale, another app (or the menu) has the screen
+        now = self._ticks()
+        if hasattr(time, "ticks_diff"):
+            return time.ticks_diff(now, self._last_beat) < 500
+        return now - self._last_beat < 500
+
     def _on_button_down(self, event):
-        # Stroking two different touch pads in quick succession = a pet
         name = getattr(event.button, "name", "")
-        if not name.startswith("TOUCH") or not self._foreground:
+        foreground = self._is_foreground()
+
+        # Keyboard hexpansion: press B anywhere to summon BunBun
+        if name == "B" and not foreground and HAS_SUMMON:
+            touch_eventbus.emit(RequestForegroundPushEvent(self))
+            return
+
+        # Stroking two different touch pads in quick succession = a pet
+        if not name.startswith("TOUCH") or not foreground:
             return
         if self.state == SLEEPY:
             self.state = CHILL
@@ -506,6 +567,10 @@ class Bunny(App):
                 ear = "R"
             elif on_left and not on_right:
                 ear = "L"
+            # When the screen is flipped the drawing rotates 180 but the
+            # pads don't move — swap sides so the ear follows the hand
+            if ear and self.flipped:
+                ear = "L" if ear == "R" else "R"
 
             self._touch_last = None
             self._pet(ear)
@@ -666,7 +731,7 @@ class Bunny(App):
             ears = EARS_FLOP
         elif stroke_ear == "R":
             ears = EARS_FLOP_R
-        elif flopping or sleepy:
+        elif (flopping and self.idle_kind == IDLE_CONTENT) or sleepy:
             ears = EARS_FLOP
         else:
             ears = EARS_UP
@@ -674,11 +739,21 @@ class Bunny(App):
         self._blit_grid(ctx, LOWER, 0, 10)
 
         # Eyes (cols 8/17, row 13)
-        line_eyes = (
-            sleepy or self.blinking > 0 or hungry or flopping
+        idle_kind = self.idle_kind if flopping else None
+        if sleepy:
+            self._blit_grid(ctx, EYE_SLEEPY, 6, 14)
+            self._blit_grid(ctx, EYE_SLEEPY, 19, 14)
+        elif idle_kind == IDLE_LOOK_L:
+            # Glances hold uninterrupted - no blinking mid-sequence
+            self._blit_grid(ctx, EYE_LOOK, 7, 12)
+            self._blit_grid(ctx, EYE_LOOK, 16, 12)
+        elif idle_kind == IDLE_LOOK_UR:
+            self._blit_grid(ctx, EYE_LOOK, 9, 11)
+            self._blit_grid(ctx, EYE_LOOK, 18, 11)
+        elif (
+            self.blinking > 0 or hungry or idle_kind == IDLE_CONTENT
             or (self.happy_timer > 0 and self.reaction == REACT_STARS)
-        )
-        if line_eyes:
+        ):
             self._blit_grid(ctx, EYE_FLAT, 8, 13)
             self._blit_grid(ctx, EYE_FLAT, 17, 13)
         else:
@@ -699,14 +774,12 @@ class Bunny(App):
             self._draw_carrot(ctx)
         elif hungry:
             self._blit_grid(ctx, CRY_MOUTH, 11, 17)
-        elif sleepy:
-            self._blit_grid(ctx, MOUTH_FLAT, 12, 16)
         elif self.happy_timer > 0 and self.reaction == REACT_STARS:
             self._blit_grid(ctx, W_SMILE, 11, 15)    # content face
         elif happy:
             self._blit_grid(ctx, NOSE_PATCH, 12, 15)
             self._blit_grid(ctx, SMILE_ARC, 11, 15)  # happy face
-        elif flopping:
+        elif flopping and self.idle_kind == IDLE_CONTENT:
             self._blit_grid(ctx, W_SMILE, 11, 15)    # lazy content flop
         # plain chill: face stays exactly as drawn
 

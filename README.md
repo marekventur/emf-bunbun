@@ -16,6 +16,14 @@ All pixel art hand-drawn by Marek Ventur.
 - **Feed it** and it munches a big carrot back to happiness.
 - **Pet it** for one of three reactions: floating hearts, twinkling gold
   stars, or a snappy little jump. Pet it too much and it needs a nap.
+- **Stroke it** (2026 boards): brush across the touch pads — the ear on
+  the side you stroke flops toward your hand.
+- **Idle personality**: it blinks, glances around, lazily flops an ear,
+  and drifts off for little naps when left alone.
+- **Battery peek**: press A for battery % and a time-remaining estimate
+  learned from your badge's real drain rate.
+- **Flip-to-face-me** (2026 boards): lift the badge to look at it and
+  the bunny flips round to face you.
 - **Four hand-picked colour palettes** (carol, choco, sky, berry), each
   with a matching day or night background.
 
@@ -25,10 +33,15 @@ Buttons as labelled on the badge:
 
 | Button | Action |
 |--------|--------|
+| A | battery peek |
 | C | pet |
 | D | change colours |
 | E | feed |
 | F | exit |
+| keyboard "B" | summon BunBun from any app (keeb hexpansion) |
+
+Tip: put `BunBun` in a file called `autoexec.bat` at the root of the
+badge filesystem and the badge boots straight into BunBun.
 
 (And one secret button. Explorers welcome.)
 
