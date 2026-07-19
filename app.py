@@ -17,7 +17,6 @@ except ImportError:
 # --- Timings (all in milliseconds) ---
 HUNGRY_AFTER_MIN = 2 * 60 * 60 * 1000   # gets hungry after 2...
 HUNGRY_AFTER_MAX = 3 * 60 * 60 * 1000   # ...to 3 hours
-EXTRA_SAD_AFTER = 30 * 60 * 1000        # hungry + ignored 30 min -> sadder
 PET_HAPPY_TIME = 2500                   # reaction time after a pet
 EAT_TIME = 3000                         # munching time
 SLEEPY_TIME = 20000                     # nap after too much petting
@@ -50,7 +49,7 @@ FIXED_COLORS = {
     "o": (1.0, 1.0, 1.0),       # fur
     "g": (0.30, 0.65, 0.30),    # carrot greens
     "O": (0.90, 0.50, 0.10),    # carrot
-    "b": (0.45, 0.65, 0.95),    # tear
+    "b": (0.01, 0.64, 1.0),     # tear
 }
 
 # Curated color combos: (name, outline "X", accent "p", bg top, bg bottom).
@@ -100,6 +99,19 @@ EARS_FLOP = [
     "......XpppoooXooopppX......",
     "......XppooooXooooppX......",
 ]
+# Both ears down (hungry/crying): the flopped ear mirrored to both sides
+EARS_SAD = [
+    "...........................",
+    "...........................",
+    ".....XXXXXX.....XXXXXX.....",
+    "....XooooooX...XooooooX....",
+    "...XooooooooX.XooooooooX...",
+    "...XoppppoooX.XoooppppoX...",
+    "....XXppppooX.XooppppXX....",
+    "......XpppooX.XoopppX......",
+    "......XpppoooXooopppX......",
+    "......XppooooXooooppX......",
+]
 
 # Head and face, rows 10+ (eyes blanked out so expressions can swap in;
 # the ∴ nose/mouth and cheeks stay as drawn).
@@ -138,7 +150,7 @@ NOSE_PATCH = ["ooo"]                      # hides the nose dot at (12,15)
 SMILE_ARC = ["X...X", ".XXX."]            # happy: big open smile (11,15)
 W_SMILE = ["X.X.X", "XXXXX"]              # content: little w smile (11,15)
 MOUTH_FLAT = ["XXX"]                      # chill/hungry flat mouth (12,16)
-MOUTH_SAD = [".XXX.", "X...X"]            # very sad frown (11,16)
+CRY_MOUTH = ["X...X"]                     # crying wail row (11,17)
 EAT_MOUTH = ["XXX", "XoX", "XoX", "XXX", "XXX"]  # big open O, from the
                                           # eat drawing, at (12,13)
 
@@ -160,7 +172,6 @@ class Bunny(App):
         self.state = CHILL
         self.time = 0                   # total ms since app start
         self.hunger_timer = self._new_hunger_timer()
-        self.hungry_for = 0             # how long we've been hungry
         self.happy_timer = 0            # >0 means a pet reaction is playing
         self.reaction = REACT_HEARTS
         self.state_timer = 0            # countdown for EATING / SLEEPY
@@ -237,9 +248,6 @@ class Bunny(App):
             self.hunger_timer -= delta
             if self.hunger_timer <= 0:
                 self.state = HUNGRY
-                self.hungry_for = 0
-        elif self.state == HUNGRY:
-            self.hungry_for += delta
 
         # Forget rapid petting after a while
         if self.pet_memory > 0:
@@ -272,14 +280,9 @@ class Bunny(App):
                 self._apply_palette()
                 self.palette_flash = PALETTE_FLASH_TIME
             elif self.button_states.get(BUTTON_TYPES["RIGHT"]):
-                # Dev shortcut (B): fast-forward time. Once -> hungry now,
-                # again -> the extra-sad neglected stage.
+                # Dev shortcut (B): fast-forward straight to hungry
                 self.button_states.clear()
-                if self.state == CHILL:
-                    self.state = HUNGRY
-                    self.hungry_for = 0
-                else:
-                    self.hungry_for += EXTRA_SAD_AFTER
+                self.state = HUNGRY
 
         if self.palette_flash > 0:
             self.palette_flash -= delta
@@ -374,7 +377,6 @@ class Bunny(App):
     def _feed(self):
         self.state = EATING
         self.state_timer = EAT_TIME
-        self.hungry_for = 0
         self.idle_flop = 0
 
     # --------------------------------------------------------------- LEDs
@@ -455,15 +457,19 @@ class Bunny(App):
             ).rectangle(-120, -120 + i * band_h, 240, band_h + 1).fill()
 
         hungry = self.state == HUNGRY
-        very_sad = hungry and self.hungry_for > EXTRA_SAD_AFTER
         sleepy = self.state == SLEEPY
         happy = self.happy_timer > 0 or self.state == EATING
         flopping = self.idle_flop > 0
 
-        # Ear flops when: relaxing, hungry/sad, or napping.
-        # Never while jumping — jumps are always straight-eared.
-        flop_ear = flopping or sleepy or hungry
-        self._blit_grid(ctx, EARS_FLOP if flop_ear else EARS_UP, 0, 0)
+        # Hungry = crying with both ears down; relaxing/napping = one
+        # lazy flopped ear. Never floppy while jumping.
+        if hungry:
+            ears = EARS_SAD
+        elif flopping or sleepy:
+            ears = EARS_FLOP
+        else:
+            ears = EARS_UP
+        self._blit_grid(ctx, ears, 0, 0)
         self._blit_grid(ctx, LOWER, 0, 10)
 
         # Eyes (cols 8/17, row 13)
@@ -478,7 +484,7 @@ class Bunny(App):
             self._blit_grid(ctx, EYE_OPEN, 8, 13)
             self._blit_grid(ctx, EYE_OPEN, 17, 13)
 
-        if very_sad:
+        if hungry:
             self._blit_grid(ctx, TEAR, 8, 14)
 
         # Mouths (all from Marek's expression drawings)
@@ -490,9 +496,9 @@ class Bunny(App):
             else:
                 self._blit_grid(ctx, MOUTH_FLAT, 12, 16)
             self._draw_carrot(ctx)
-        elif very_sad:
-            self._blit_grid(ctx, MOUTH_SAD, 11, 16)
-        elif hungry or sleepy:
+        elif hungry:
+            self._blit_grid(ctx, CRY_MOUTH, 11, 17)
+        elif sleepy:
             self._blit_grid(ctx, MOUTH_FLAT, 12, 16)
         elif self.happy_timer > 0 and self.reaction == REACT_STARS:
             self._blit_grid(ctx, W_SMILE, 11, 15)    # content face
@@ -521,7 +527,8 @@ class Bunny(App):
             ctx.rgb(*self.colors["X"]).move_to(0, -102).text(self.palette_name)
         ctx.font_size = 13
         if hungry:
-            ctx.rgb(0.80, 0.30, 0.10).move_to(0, 100).text("I'm hungry! E = feed")
+            ctx.rgb(0.80, 0.30, 0.10).move_to(0, 88).text("I'm hungry!")
+            ctx.rgb(0.80, 0.30, 0.10).move_to(0, 104).text("E = feed")
         elif sleepy:
             ctx.rgb(0.48, 0.40, 0.62).move_to(0, 100).text("shhh... napping")
         elif self.state == CHILL:
