@@ -14,16 +14,45 @@ try:
 except ImportError:
     HAS_LEDS = False
 
+try:
+    import power
+    HAS_POWER = True
+except ImportError:
+    HAS_POWER = False
+
+try:
+    import imu
+    HAS_IMU = True
+except ImportError:
+    HAS_IMU = False
+
+try:
+    import settings
+    HAS_SETTINGS = True
+except ImportError:
+    HAS_SETTINGS = False
+
+# Touch pads (2026 frontboard): TOUCH01..TOUCH12 arrive as button events
+try:
+    from system.eventbus import eventbus as touch_eventbus
+    from events.input import ButtonDownEvent
+    HAS_TOUCH = True
+except ImportError:
+    HAS_TOUCH = False
+
 # --- Timings (all in milliseconds) ---
 HUNGRY_AFTER_MIN = 2 * 60 * 60 * 1000   # gets hungry after 2...
 HUNGRY_AFTER_MAX = 3 * 60 * 60 * 1000   # ...to 3 hours
 PET_HAPPY_TIME = 2500                   # reaction time after a pet
 EAT_TIME = 3000                         # munching time
 SLEEPY_TIME = 20000                     # nap after too much petting
-PETS_UNTIL_SLEEPY = 6                   # pets in quick succession before nap
-PET_MEMORY = 10000                      # how long "quick succession" lasts
+PETS_UNTIL_SLEEPY = 5                   # pets in quick succession before nap
+PET_MEMORY = 15000                      # how long "quick succession" lasts
 PALETTE_FLASH_TIME = 1500               # how long the palette name shows
 IDLE_FLOP_TIME = 4000                   # how long a lazy ear-flop moment lasts
+BATTERY_FLASH_TIME = 4000               # how long the battery peek shows
+BATT_SAMPLE_MS = 60000                  # battery sampled once a minute
+STROKE_WINDOW = 900                     # two touch pads within this = a stroke
 
 # Pet states
 CHILL = 0
@@ -113,6 +142,14 @@ EARS_SAD = [
     "......XppooooXooooppX......",
 ]
 
+# The same flop mirrored to the right ear (for strokes on the right)
+EARS_FLOP_R = ["".join(reversed(row)) for row in EARS_FLOP]
+
+# Touch pads follow the LED clock layout: 12/1 top, 2-5 right side,
+# 6/7 bottom, 8-11 left side
+RIGHT_PADS = (1, 2, 3, 4, 5)
+LEFT_PADS = (8, 9, 10, 11, 12)
+
 # Head and face, rows 10+ (eyes blanked out so expressions can swap in;
 # the ∴ nose/mouth and cheeks stay as drawn).
 LOWER = [
@@ -179,6 +216,7 @@ class Bunny(App):
         self.pet_memory = 0
         self.particles = []             # floating hearts/stars: [x, y, age, kind, px]
         self.hop = 0                    # vertical offset for the bounce reaction
+        self.pet_ear = None             # which ear flops during a stroke pet
 
         self.palette_index = 0
         self.palette_flash = 0          # shows the palette name briefly
@@ -191,6 +229,29 @@ class Bunny(App):
         self.idle_flop_timer = self._new_flop_timer()
 
         self.last_leds = None
+
+        # Battery peek + learned drain rate (persisted across restarts)
+        self.battery_flash = 0
+        self.batt_level = None
+        self.batt_charging = False
+        self.batt_sample_timer = 1000   # first sample shortly after launch
+        self._batt_anchor = None        # (time, level) drain measurement anchor
+        self.drain_rate = 0.0           # % per hour
+        self.drain_n = 0
+        if HAS_SETTINGS:
+            self.drain_rate = settings.get("bunbun_drain_pph", 0.0) or 0.0
+            self.drain_n = settings.get("bunbun_drain_n", 0) or 0
+
+        # Flip the screen when the badge is lifted up to face the wearer
+        self.flipped = False
+        self.imu_timer = 0
+
+        # Stroke-to-pet via the 2026 board touch pads
+        self._foreground = True
+        self._touch_last = None
+        self._touch_last_t = -STROKE_WINDOW
+        if HAS_TOUCH:
+            touch_eventbus.on(ButtonDownEvent, self._on_button_down, self)
 
     def _new_hunger_timer(self):
         return random.randint(HUNGRY_AFTER_MIN, HUNGRY_AFTER_MAX)
@@ -214,9 +275,34 @@ class Bunny(App):
 
     def update(self, delta):
         self.time += delta
+        self._foreground = True
+
+        # Battery: sample once a minute, learn the drain rate
+        self.batt_sample_timer -= delta
+        if self.batt_sample_timer <= 0:
+            self.batt_sample_timer = BATT_SAMPLE_MS
+            self._sample_battery()
+        if self.battery_flash > 0:
+            self.battery_flash -= delta
+
+        # Lifted-to-look detection: when the badge tips past vertical the
+        # gravity reading along its top-bottom axis flips sign
+        if HAS_IMU:
+            self.imu_timer -= delta
+            if self.imu_timer <= 0:
+                self.imu_timer = 250
+                try:
+                    ax = imu.acc_read()[0]
+                    if not self.flipped and ax < -3:
+                        self.flipped = True
+                    elif self.flipped and ax > 3:
+                        self.flipped = False
+                except Exception:
+                    pass
 
         if self.button_states.get(BUTTON_TYPES["CANCEL"]):
             self.button_states.clear()
+            self._foreground = False
             self._leds_off()
             if HAS_LEDS:
                 eventbus.emit(PatternEnable())  # give LEDs back to the OS
@@ -279,6 +365,11 @@ class Bunny(App):
                 self.palette_index = (self.palette_index + 1) % len(PALETTES)
                 self._apply_palette()
                 self.palette_flash = PALETTE_FLASH_TIME
+            elif self.button_states.get(BUTTON_TYPES["UP"]):
+                # A = battery peek (small overlay, bunny stays visible)
+                self.button_states.clear()
+                self._sample_battery()
+                self.battery_flash = BATTERY_FLASH_TIME
             elif self.button_states.get(BUTTON_TYPES["RIGHT"]):
                 # Dev shortcut (B): fast-forward straight to hungry
                 self.button_states.clear()
@@ -323,7 +414,12 @@ class Bunny(App):
 
         self._update_leds()
 
-    def _pet(self):
+    def _pet(self, ear=None):
+        # One pet at a time: while a reaction is playing, extra strokes
+        # and presses are part of the same pet, not a new one
+        if self.happy_timer > 0:
+            return
+        self.pet_ear = ear
         self.happy_timer = PET_HAPPY_TIME
         self.idle_flop = 0
 
@@ -378,6 +474,98 @@ class Bunny(App):
         self.state = EATING
         self.state_timer = EAT_TIME
         self.idle_flop = 0
+
+    # -------------------------------------------------------------- touch
+
+    def _on_button_down(self, event):
+        # Stroking two different touch pads in quick succession = a pet
+        name = getattr(event.button, "name", "")
+        if not name.startswith("TOUCH") or not self._foreground:
+            return
+        if self.state == SLEEPY:
+            self.state = CHILL
+            self.recent_pets = 0
+            return
+        if self.state not in (CHILL, HUNGRY):
+            return
+        if (
+            self._touch_last is not None
+            and name != self._touch_last
+            and self.time - self._touch_last_t < STROKE_WINDOW
+        ):
+            # Stroked along one side? That ear flops toward your hand
+            try:
+                a = int(self._touch_last[5:])
+                b = int(name[5:])
+            except ValueError:
+                a = b = 0
+            on_right = a in RIGHT_PADS or b in RIGHT_PADS
+            on_left = a in LEFT_PADS or b in LEFT_PADS
+            ear = None
+            if on_right and not on_left:
+                ear = "R"
+            elif on_left and not on_right:
+                ear = "L"
+
+            self._touch_last = None
+            self._pet(ear)
+        else:
+            self._touch_last = name
+            self._touch_last_t = self.time
+
+    # ------------------------------------------------------------ battery
+
+    def _sample_battery(self):
+        if not HAS_POWER:
+            return
+        try:
+            level = power.BatteryLevel()
+            state = power.BatteryChargeState()
+        except Exception:
+            return
+        self.batt_level = level
+        self.batt_charging = state != "Not Charging"
+
+        # Learn the drain rate: measure % lost between two points in time.
+        # Charging invalidates the measurement window.
+        if self.batt_charging:
+            self._batt_anchor = None
+            return
+        if self._batt_anchor is None:
+            self._batt_anchor = (self.time, level)
+            return
+        t0, l0 = self._batt_anchor
+        if level > l0 + 0.5:
+            # Level went up: got charged in between, restart measurement
+            self._batt_anchor = (self.time, level)
+        elif level < l0 - 0.4:
+            hours = (self.time - t0) / 3600000
+            if hours > 0:
+                rate = (l0 - level) / hours
+                if 0 < rate < 60:
+                    if self.drain_rate > 0:
+                        self.drain_rate = self.drain_rate * 0.8 + rate * 0.2
+                    else:
+                        self.drain_rate = rate
+                    self.drain_n += 1
+                    if HAS_SETTINGS and self.drain_n % 3 == 0:
+                        settings.set("bunbun_drain_pph", self.drain_rate)
+                        settings.set("bunbun_drain_n", self.drain_n)
+                        settings.save()
+            self._batt_anchor = (self.time, level)
+
+    def _battery_text(self):
+        if self.batt_level is None:
+            return "battery ?"
+        text = "{}%".format(int(self.batt_level))
+        if self.batt_charging:
+            return text + " charging"
+        if self.drain_rate > 0.3 and self.drain_n >= 3:
+            mins = int(self.batt_level / self.drain_rate * 60)
+            if mins >= 60:
+                return "{} ~{}h{:02d}m".format(text, mins // 60, mins % 60)
+            return "{} ~{}m".format(text, mins)
+        return text + " learning..."
 
     # --------------------------------------------------------------- LEDs
 
@@ -444,6 +632,9 @@ class Bunny(App):
 
     def draw(self, ctx):
         clear_background(ctx)
+        ctx.save()
+        if self.flipped:
+            ctx.rotate(math.pi)
 
         # Palette background gradient in chunky horizontal bands
         top, bottom = self.bg_top, self.bg_bottom
@@ -461,10 +652,20 @@ class Bunny(App):
         happy = self.happy_timer > 0 or self.state == EATING
         flopping = self.idle_flop > 0
 
-        # Hungry = crying with both ears down; relaxing/napping = one
-        # lazy flopped ear. Never floppy while jumping.
+        # Hungry = crying with both ears down; a stroke pet flops the ear
+        # on the stroked side; relaxing/napping = one lazy flopped ear.
+        # Never floppy while jumping.
+        stroke_ear = (
+            self.pet_ear
+            if self.happy_timer > 0 and self.reaction != REACT_BOUNCE
+            else None
+        )
         if hungry:
             ears = EARS_SAD
+        elif stroke_ear == "L":
+            ears = EARS_FLOP
+        elif stroke_ear == "R":
+            ears = EARS_FLOP_R
         elif flopping or sleepy:
             ears = EARS_FLOP
         else:
@@ -522,7 +723,13 @@ class Bunny(App):
         # Text overlays
         ctx.text_align = ctx.CENTER
         ctx.text_baseline = ctx.MIDDLE
-        if self.palette_flash > 0:
+        if self.battery_flash > 0:
+            ctx.font_size = 15
+            batt = self._battery_text()
+            ctx.rgb(*self.colors["X"]).move_to(0, -102).text(batt)
+            ctx.move_to(0.9, -102.5).text(batt)
+            ctx.move_to(0.5, -101.5).text(batt)
+        elif self.palette_flash > 0:
             ctx.font_size = 14
             ctx.rgb(*self.colors["X"]).move_to(0, -102).text(self.palette_name)
         ctx.font_size = 13
@@ -536,6 +743,8 @@ class Bunny(App):
             hints = ("C = pet", "D = colour", "E = feed")
             hint = hints[(self.time // 3000) % 3]
             ctx.rgb(0.80, 0.60, 0.55).move_to(0, 100).text(hint)
+
+        ctx.restore()
 
     def _draw_carrot(self, ctx):
         # Big carrot right in front of the mouth, shrinking as it's eaten
